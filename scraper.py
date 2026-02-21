@@ -92,24 +92,45 @@ class QISScraper:
             f"&root120261={root_path}&P.vx=kurz"
         )
 
+    # === TOP-LEVEL: Quick scan for Lehramtstypen ===
+
+    def scan_top_level(self):
+        """Scannt nur die erste Ebene (L1, L2, L3, L5 etc.)."""
+        url = self._build_tree_url(START_ROOT)
+        soup = self._get_page(url)
+        if not soup:
+            return []
+        nodes = self._find_tree_children(soup, START_ROOT)
+        return [{"name": n.name, "root_path": n.root_path} for n in nodes]
+
     # === PHASE 1: Tree Scan ===
 
-    def scan_tree(self):
+    def scan_tree(self, start_root=None):
         self.progress = {"phase": "scan", "status": "Scanne Baumstruktur...", "current": 0, "total": 0, "details": []}
 
-        url = self._build_tree_url(START_ROOT)
+        root = start_root or START_ROOT
+        url = self._build_tree_url(root)
         soup = self._get_page(url)
         if not soup:
             self.progress["status"] = "Fehler beim Laden der Startseite"
             self.progress["phase"] = "error"
             return []
 
-        top_nodes = self._find_tree_children(soup, START_ROOT)
+        top_nodes = self._find_tree_children(soup, root)
+
+        # If no children found, this node itself might have courses
+        if not top_nodes and start_root:
+            # Create a single node for this root
+            node = BaumKnoten(name="Ausgewählter Bereich", root_path=root, url=url)
+            ver_table = soup.find("table", summary="Übersicht über alle Veranstaltungen")
+            if ver_table:
+                node.has_veranstaltungen = True
+            top_nodes = [node]
 
         for node in top_nodes:
             logger.info(f"Scanne: {node.name}")
             self.progress["status"] = f"Scanne {node.name}..."
-            self._scan_node_recursive(node, 0, 3)
+            self._scan_node_recursive(node, 0, 6)
 
         self.progress["phase"] = "scan_done"
         self.progress["status"] = f"Struktur geladen: {self._count_nodes(top_nodes)} Bereiche"
