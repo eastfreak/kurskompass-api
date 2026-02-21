@@ -1,8 +1,7 @@
 """
 KursKompass API – Flask Backend (für Render.com)
-Stellt die Scraping-Funktionalität als REST-API bereit.
+Pro-User Datenspeicherung: Jeder User hat eigene Tree/Veranstaltungen.
 """
-
 import os
 import json
 import threading
@@ -19,46 +18,95 @@ from scraper import (
 )
 
 app = Flask(__name__)
+CORS(app)
 
-# CORS: Erlaubt Requests von kurskompass.info
-CORS(app, origins=[
-    "https://kurskompass.info",
-    "https://www.kurskompass.info",
-    "http://kurskompass.info",
-    "http://www.kurskompass.info",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-])
+# User-Verwaltung: "user1:pass1,user2:pass2"
+USERS_STR = os.environ.get("USERS", "loni:kurskompass2026")
+USERS = {}
+for pair in USERS_STR.split(","):
+    pair = pair.strip()
+    if ":" in pair:
+        u, p = pair.split(":", 1)
+        USERS[u.strip()] = p.strip()
 
-# Einfache API-Key Authentifizierung
 API_KEY = os.environ.get("API_KEY", "loni-kurskompass-2026-secret")
 
-# Globaler Scraper
-scraper_instance = QISScraper()
-cached_tree = None
-cached_veranstaltungen = None
+# Pro-User Caches: { "loni": {"tree": [...], "veranstaltungen": [...]} }
+user_caches = {}
+cached_lehramtstypen = None
 scraper_lock = threading.Lock()
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def check_auth():
-    """Prüft API-Key im Header oder Query-Parameter."""
     key = request.headers.get("X-API-Key") or request.args.get("key")
     if key != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
     return None
 
 
+def get_user():
+    """Holt Username aus Header."""
+    return request.headers.get("X-User") or request.args.get("user") or "default"
+
+
+def get_user_cache(user):
+    if user not in user_caches:
+        user_caches[user] = {"tree": None, "veranstaltungen": None}
+    return user_caches[user]
+
+
+def user_file(user, name):
+    """Gibt Dateipfad für user-spezifische Datei zurück."""
+    return os.path.join(DATA_DIR, f"{name}_{user}.json")
+
+
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "app": "KursKompass API", "version": "1.0"})
+    return jsonify({"status": "ok", "app": "KursKompass API", "version": "1.2"})
 
 
 @app.route("/api/ping")
 def ping():
-    """Wakeup-Endpoint (kein Auth nötig)."""
     return jsonify({"status": "awake"})
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.json or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+
+    if username in USERS and USERS[username] == password:
+        return jsonify({"status": "ok", "user": username, "api_key": API_KEY})
+    else:
+        return jsonify({"status": "error", "message": "Falscher Benutzername oder Passwort"}), 401
+
+
+@app.route("/api/lehramtstypen")
+def api_lehramtstypen():
+    auth_error = check_auth()
+    if auth_error:
+        return auth_error
+
+    global cached_lehramtstypen
+
+    lt_file = os.path.join(DATA_DIR, "lehramtstypen.json")
+    if cached_lehramtstypen:
+        return jsonify(cached_lehramtstypen)
+    elif os.path.exists(lt_file):
+        with open(lt_file, "r", encoding="utf-8") as f:
+            cached_lehramtstypen = json.load(f)
+            return jsonify(cached_lehramtstypen)
+
+    scraper = QISScraper()
+    typen = scraper.scan_top_level()
+    if typen:
+        cached_lehramtstypen = typen
+        with open(lt_file, "w", encoding="utf-8") as f:
+            json.dump(typen, f, ensure_ascii=False, indent=2)
+    return jsonify(typen)
 
 
 @app.route("/api/scan-tree", methods=["POST"])
@@ -67,19 +115,27 @@ def api_scan_tree():
     if auth_error:
         return auth_error
 
-    global cached_tree
+    user = get_user()
 
     if scraper_lock.locked():
-        return jsonify({"error": "Scraping läuft bereits"}), 409
+        return jsonify({"error": "Scraping läuft bereits. Bitte warte bis der aktuelle Scan fertig ist."}), 409
+
+    start_root = None
+    if request.json:
+        start_root = request.json.get("root_path")
 
     def do_scan():
-        global cached_tree
+        cache = get_user_cache(user)
         with scraper_lock:
-            tree = scraper_instance.scan_tree()
-            cached_tree = tree
+            scraper = QISScraper()
+            # Share progress on the app level for polling
+            app.config["current_scraper"] = scraper
+            tree = scraper.scan_tree(start_root=start_root)
+            cache["tree"] = tree
             tree_data = tree_to_dict(tree)
-            with open(os.path.join(DATA_DIR, "tree.json"), "w", encoding="utf-8") as f:
+            with open(user_file(user, "tree"), "w", encoding="utf-8") as f:
                 json.dump(tree_data, f, ensure_ascii=False, indent=2)
+            app.config.pop("current_scraper", None)
 
     thread = threading.Thread(target=do_scan)
     thread.start()
@@ -88,20 +144,20 @@ def api_scan_tree():
 
 @app.route("/api/tree")
 def api_get_tree():
-    """Gibt gecachten Baum zurück."""
     auth_error = check_auth()
     if auth_error:
         return auth_error
 
-    global cached_tree
+    user = get_user()
+    cache = get_user_cache(user)
 
-    tree_file = os.path.join(DATA_DIR, "tree.json")
-    if cached_tree:
-        return jsonify(tree_to_dict(cached_tree))
-    elif os.path.exists(tree_file):
-        with open(tree_file, "r", encoding="utf-8") as f:
+    tf = user_file(user, "tree")
+    if cache["tree"]:
+        return jsonify(tree_to_dict(cache["tree"]))
+    elif os.path.exists(tf):
+        with open(tf, "r", encoding="utf-8") as f:
             data = json.load(f)
-            cached_tree = dict_to_tree(data)
+            cache["tree"] = dict_to_tree(data)
             return jsonify(data)
     return jsonify(None)
 
@@ -112,32 +168,35 @@ def api_scrape():
     if auth_error:
         return auth_error
 
-    global cached_tree, cached_veranstaltungen
+    user = get_user()
+    cache = get_user_cache(user)
 
     if scraper_lock.locked():
-        return jsonify({"error": "Scraping läuft bereits"}), 409
+        return jsonify({"error": "Scraping läuft bereits. Bitte warte bis der aktuelle Vorgang fertig ist."}), 409
 
     selected = request.json.get("selected", [])
     if not selected:
         return jsonify({"error": "Keine Bereiche ausgewählt"}), 400
 
-    if not cached_tree:
-        tree_file = os.path.join(DATA_DIR, "tree.json")
-        if os.path.exists(tree_file):
-            with open(tree_file, "r", encoding="utf-8") as f:
-                cached_tree = dict_to_tree(json.load(f))
+    if not cache["tree"]:
+        tf = user_file(user, "tree")
+        if os.path.exists(tf):
+            with open(tf, "r", encoding="utf-8") as f:
+                cache["tree"] = dict_to_tree(json.load(f))
         else:
             return jsonify({"error": "Bitte zuerst Struktur laden"}), 400
 
     def do_scrape():
-        global cached_veranstaltungen
         with scraper_lock:
-            veranstaltungen = scraper_instance.scrape_selected(cached_tree, set(selected))
+            scraper = QISScraper()
+            app.config["current_scraper"] = scraper
+            veranstaltungen = scraper.scrape_selected(cache["tree"], set(selected))
             from dataclasses import asdict
             ver_data = [asdict(v) for v in veranstaltungen]
-            cached_veranstaltungen = ver_data
-            with open(os.path.join(DATA_DIR, "veranstaltungen.json"), "w", encoding="utf-8") as f:
+            cache["veranstaltungen"] = ver_data
+            with open(user_file(user, "veranstaltungen"), "w", encoding="utf-8") as f:
                 json.dump(ver_data, f, ensure_ascii=False, indent=2)
+            app.config.pop("current_scraper", None)
 
     thread = threading.Thread(target=do_scrape)
     thread.start()
@@ -149,25 +208,29 @@ def api_progress():
     auth_error = check_auth()
     if auth_error:
         return auth_error
-    return jsonify(scraper_instance.progress)
+
+    scraper = app.config.get("current_scraper")
+    if scraper:
+        return jsonify(scraper.progress)
+    return jsonify({"phase": "idle", "status": "Bereit", "current": 0, "total": 0, "details": []})
 
 
 @app.route("/api/veranstaltungen")
 def api_veranstaltungen():
-    """Gibt gecachte Veranstaltungen zurück."""
     auth_error = check_auth()
     if auth_error:
         return auth_error
 
-    global cached_veranstaltungen
+    user = get_user()
+    cache = get_user_cache(user)
 
-    ver_file = os.path.join(DATA_DIR, "veranstaltungen.json")
-    if cached_veranstaltungen:
-        return jsonify({"data": cached_veranstaltungen, "count": len(cached_veranstaltungen)})
-    elif os.path.exists(ver_file):
-        with open(ver_file, "r", encoding="utf-8") as f:
-            cached_veranstaltungen = json.load(f)
-            return jsonify({"data": cached_veranstaltungen, "count": len(cached_veranstaltungen)})
+    vf = user_file(user, "veranstaltungen")
+    if cache["veranstaltungen"]:
+        return jsonify({"data": cache["veranstaltungen"], "count": len(cache["veranstaltungen"])})
+    elif os.path.exists(vf):
+        with open(vf, "r", encoding="utf-8") as f:
+            cache["veranstaltungen"] = json.load(f)
+            return jsonify({"data": cache["veranstaltungen"], "count": len(cache["veranstaltungen"])})
     return jsonify({"data": None, "count": 0})
 
 
@@ -177,16 +240,19 @@ def api_download_excel():
     if auth_error:
         return auth_error
 
-    global cached_veranstaltungen
+    user = get_user()
+    cache = get_user_cache(user)
 
-    if not cached_veranstaltungen:
-        ver_file = os.path.join(DATA_DIR, "veranstaltungen.json")
-        if os.path.exists(ver_file):
-            with open(ver_file, "r", encoding="utf-8") as f:
-                cached_veranstaltungen = json.load(f)
+    if not cache["veranstaltungen"]:
+        vf = user_file(user, "veranstaltungen")
+        if os.path.exists(vf):
+            with open(vf, "r", encoding="utf-8") as f:
+                cache["veranstaltungen"] = json.load(f)
 
-    if not cached_veranstaltungen:
+    if not cache["veranstaltungen"]:
         return jsonify({"error": "Keine Daten vorhanden"}), 404
+
+    ver_data = cache["veranstaltungen"]
 
     wb = Workbook()
     ws = wb.active
@@ -201,7 +267,7 @@ def api_download_excel():
     )
 
     headers = [
-        "Bereich", "Kennung", "Titel", "Art", "Dozent",
+        "Titel", "Bereich", "Modul", "Art", "Dozent",
         "Tag", "Zeit", "Rhythmus", "Raum", "SWS",
         "Max. TN", "Belegung", "Semester", "Studiengänge"
     ]
@@ -212,9 +278,9 @@ def api_download_excel():
         cell.alignment = header_align
         cell.border = thin_border
 
-    for row_idx, v in enumerate(cached_veranstaltungen, 2):
+    for row_idx, v in enumerate(ver_data, 2):
         values = [
-            v.get("pfad", ""), v.get("kennung", ""), v.get("titel", ""),
+            v.get("titel", ""), v.get("pfad", ""), v.get("kennung", ""),
             v.get("veranstaltungsart", ""), v.get("dozent", ""),
             v.get("tag", ""), v.get("zeit", ""), v.get("rhythmus", ""),
             v.get("raum", ""), v.get("sws", ""), v.get("max_teilnehmer", ""),
@@ -225,18 +291,18 @@ def api_download_excel():
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-    widths = [30, 12, 40, 20, 25, 6, 16, 8, 30, 5, 8, 12, 12, 40]
+    widths = [40, 30, 12, 20, 25, 6, 16, 8, 30, 5, 8, 12, 12, 40]
     for i, w in enumerate(widths):
         col_letter = chr(65 + i)
         ws.column_dimensions[col_letter].width = w
 
-    ws.auto_filter.ref = f"A1:N{len(cached_veranstaltungen) + 1}"
+    ws.auto_filter.ref = f"A1:N{len(ver_data) + 1}"
 
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
-    filename = f"KursKompass_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    filename = f"KursKompass_{user}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     return send_file(output, as_attachment=True, download_name=filename,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
