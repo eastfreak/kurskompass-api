@@ -109,7 +109,7 @@ class QISScraper:
         for node in top_nodes:
             logger.info(f"Scanne: {node.name}")
             self.progress["status"] = f"Scanne {node.name}..."
-            self._scan_node_recursive(node, 0, 3)
+            self._scan_node_recursive(node, 0, 6)
 
         self.progress["phase"] = "scan_done"
         self.progress["status"] = f"Struktur geladen: {self._count_nodes(top_nodes)} Bereiche"
