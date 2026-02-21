@@ -120,17 +120,29 @@ def api_scan_tree():
     if scraper_lock.locked():
         return jsonify({"error": "Scraping läuft bereits. Bitte warte bis der aktuelle Scan fertig ist."}), 409
 
-    start_root = None
+    start_roots = None
     if request.json:
-        start_root = request.json.get("root_path")
+        # Mehrere Studiengänge oder einzelner
+        start_roots = request.json.get("root_paths")
+        if not start_roots:
+            single = request.json.get("root_path")
+            if single:
+                start_roots = [single]
 
     def do_scan():
         cache = get_user_cache(user)
         with scraper_lock:
             scraper = QISScraper()
-            # Share progress on the app level for polling
             app.config["current_scraper"] = scraper
-            tree = scraper.scan_tree(start_root=start_root)
+            if start_roots and len(start_roots) > 0:
+                # Mehrere Roots nacheinander scannen, Ergebnisse zusammenführen
+                all_trees = []
+                for root in start_roots:
+                    partial = scraper.scan_tree(start_root=root)
+                    all_trees.extend(partial)
+                tree = all_trees
+            else:
+                tree = scraper.scan_tree()
             cache["tree"] = tree
             tree_data = tree_to_dict(tree)
             with open(user_file(user, "tree"), "w", encoding="utf-8") as f:
