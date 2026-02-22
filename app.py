@@ -148,7 +148,7 @@ def api_scan_tree():
             tree_data = tree_to_dict(tree)
             with open(user_file(user, "tree"), "w", encoding="utf-8") as f:
                 json.dump(tree_data, f, ensure_ascii=False, indent=2)
-            app.config.pop("current_scraper", None)
+            # Don't pop scraper - let polling read final "scan_done" state
 
     thread = threading.Thread(target=do_scan)
     thread.start()
@@ -209,7 +209,7 @@ def api_scrape():
             cache["veranstaltungen"] = ver_data
             with open(user_file(user, "veranstaltungen"), "w", encoding="utf-8") as f:
                 json.dump(ver_data, f, ensure_ascii=False, indent=2)
-            app.config.pop("current_scraper", None)
+            # Don't pop scraper - let polling read final "done" state
 
     thread = threading.Thread(target=do_scrape)
     thread.start()
