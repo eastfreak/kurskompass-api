@@ -3,6 +3,7 @@ KursKompass API – Flask Backend (für Render.com)
 Pro-User Datenspeicherung: Jeder User hat eigene Tree/Veranstaltungen.
 """
 import os
+import re
 import json
 import threading
 from datetime import datetime
@@ -279,8 +280,8 @@ def api_download_excel():
     )
 
     headers = [
-        "Titel", "Bereich", "Modul", "Art", "Dozent",
-        "Tag", "Zeit", "Rhythmus", "Raum", "SWS",
+        "Titel", "Bereich", "Modul", "Art", "Gruppe", "Dozent",
+        "Tag", "Zeit", "Rhythmus", "Gebäude", "Raum", "SWS",
         "Max. TN", "Belegung", "Semester", "Studiengänge"
     ]
     for col, header in enumerate(headers, 1):
@@ -291,11 +292,16 @@ def api_download_excel():
         cell.border = thin_border
 
     for row_idx, v in enumerate(ver_data, 2):
+        raum = v.get("raum", "")
+        # Gebäude aus Raum extrahieren
+        geb_match = re.match(r'^(.+?)\s*\d', raum)
+        gebaeude = geb_match.group(1).rstrip(" -") if geb_match else raum.split(" - ")[0] if raum else ""
+
         values = [
             v.get("titel", ""), v.get("pfad", ""), v.get("kennung", ""),
-            v.get("veranstaltungsart", ""), v.get("dozent", ""),
+            v.get("veranstaltungsart", ""), v.get("gruppe", ""), v.get("dozent", ""),
             v.get("tag", ""), v.get("zeit", ""), v.get("rhythmus", ""),
-            v.get("raum", ""), v.get("sws", ""), v.get("max_teilnehmer", ""),
+            gebaeude, raum, v.get("sws", ""), v.get("max_teilnehmer", ""),
             v.get("belegung", ""), v.get("semester", ""), v.get("studiengaenge", ""),
         ]
         for col, val in enumerate(values, 1):
@@ -303,12 +309,12 @@ def api_download_excel():
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-    widths = [40, 30, 12, 20, 25, 6, 16, 8, 30, 5, 8, 12, 12, 40]
+    widths = [40, 30, 12, 20, 12, 25, 6, 16, 8, 25, 30, 5, 8, 12, 12, 40]
     for i, w in enumerate(widths):
         col_letter = chr(65 + i)
         ws.column_dimensions[col_letter].width = w
 
-    ws.auto_filter.ref = f"A1:N{len(ver_data) + 1}"
+    ws.auto_filter.ref = f"A1:P{len(ver_data) + 1}"
 
     output = BytesIO()
     wb.save(output)
