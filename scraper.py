@@ -30,6 +30,7 @@ class Veranstaltung:
     veranstaltungsart: str = ""
     semester: str = ""
     sws: str = ""
+    gruppe: str = ""
     tag: str = ""
     zeit: str = ""
     rhythmus: str = ""
@@ -264,14 +265,58 @@ class QISScraper:
 
             detail = self._scrape_detail(detail_url)
 
+            # Modul-Fix: Wenn kennung leer, aus Pfad den letzten Bereich nehmen
+            if not kennung and path:
+                kennung = path[-1] if len(path) > 0 else ""
+
+            base_dozent = dozent or (detail.get("dozent", "") if detail else "")
+            gruppen = detail.get("gruppen", []) if detail else []
+
+            # Wenn Gruppen vorhanden: Pro Gruppe einen Eintrag
+            if gruppen and len(gruppen) > 1:
+                # Prüfe ob es echte Gruppen sind (verschiedene Gruppennamen)
+                gruppe_namen = set(g.get("gruppe", "") for g in gruppen)
+                has_real_groups = any(g for g in gruppe_namen if g)
+
+                if has_real_groups:
+                    for g in gruppen:
+                        v = Veranstaltung(
+                            pfad=" > ".join(path),
+                            kennung=kennung,
+                            titel=titel,
+                            dozent=g.get("dozent", "") or base_dozent,
+                            veranstaltungsart=vst_art,
+                            semester=detail.get("semester", "") if detail else "",
+                            sws=detail.get("sws", "") if detail else "",
+                            gruppe=g.get("gruppe", ""),
+                            tag=g.get("tag", ""),
+                            zeit=g.get("zeit", ""),
+                            rhythmus=g.get("rhythmus", ""),
+                            raum=g.get("raum", ""),
+                            max_teilnehmer=detail.get("max_teilnehmer", "") if detail else "",
+                            belegung=detail.get("belegung", "") if detail else "",
+                            belegungsfristen=detail.get("belegungsfristen", "") if detail else "",
+                            credits=detail.get("credits", "") if detail else "",
+                            sprache=detail.get("sprache", "") if detail else "",
+                            kuerzel=detail.get("kuerzel", "") if detail else "",
+                            studiengaenge=detail.get("studiengaenge", "") if detail else "",
+                            kommentar=detail.get("kommentar", "") if detail else "",
+                            voraussetzungen=detail.get("voraussetzungen", "") if detail else "",
+                            detail_url=detail_url,
+                        )
+                        self.veranstaltungen.append(v)
+                    continue
+
+            # Normaler Eintrag (keine Gruppen oder nur eine Gruppe)
             v = Veranstaltung(
                 pfad=" > ".join(path),
                 kennung=kennung,
                 titel=titel,
-                dozent=dozent or (detail.get("dozent", "") if detail else ""),
+                dozent=base_dozent,
                 veranstaltungsart=vst_art,
                 semester=detail.get("semester", "") if detail else "",
                 sws=detail.get("sws", "") if detail else "",
+                gruppe=gruppen[0].get("gruppe", "") if gruppen else "",
                 tag=detail.get("tag", "") if detail else "",
                 zeit=detail.get("zeit", "") if detail else "",
                 rhythmus=detail.get("rhythmus", "") if detail else "",
@@ -286,7 +331,7 @@ class QISScraper:
                 kommentar=detail.get("kommentar", "") if detail else "",
                 voraussetzungen=detail.get("voraussetzungen", "") if detail else "",
                 detail_url=detail_url,
-                weitere_termine=detail.get("weitere_termine", []) if detail else [],
+                weitere_termine=gruppen[1:] if len(gruppen) > 1 else [],
             )
             self.veranstaltungen.append(v)
 
@@ -331,46 +376,79 @@ class QISScraper:
                     fristen.append(frist_text)
             result["belegungsfristen"] = " | ".join(fristen)
 
-        # TERMINE
-        termine_table = soup.find("table", summary="Übersicht über alle Veranstaltungstermine")
-        if termine_table:
-            termine = []
-            rows = termine_table.find_all("tr")
-            for row in rows[1:]:
-                cells = row.find_all("td")
-                if len(cells) < 6:
-                    continue
+        # TERMINE – mit Gruppen-Erkennung
+        gruppen = []
 
-                termin = {}
-                cell_texts = [c.get_text(strip=True) for c in cells]
+        # Suche nach Gruppen-Überschriften ("Termine Gruppe: Gruppe 1")
+        gruppe_headers = soup.find_all(string=re.compile(r"Termine\s+Gruppe.*Gruppe\s*\d+"))
+        if not gruppe_headers:
+            # Auch nach Überschriften-Tags suchen
+            for tag in soup.find_all(["h2", "h3", "caption", "b", "strong"]):
+                text = tag.get_text(strip=True)
+                if re.search(r"Gruppe\s*\d+", text) and "Termin" in text:
+                    gruppe_headers.append(tag)
 
-                for i, text in enumerate(cell_texts):
-                    if re.match(r'^(Mo|Di|Mi|Do|Fr|Sa|So)\.?$', text):
-                        termin["tag"] = text
-                        if i + 1 < len(cell_texts):
-                            termin["zeit"] = cell_texts[i + 1].replace('\xa0', ' ')
-                        if i + 2 < len(cell_texts):
-                            termin["rhythmus"] = cell_texts[i + 2]
+        if gruppe_headers:
+            # Gruppen-Modus: Jede Gruppe hat eigene Termine
+            for gh in gruppe_headers:
+                gruppe_name_match = re.search(r"Gruppe\s*(\d+)", str(gh) if isinstance(gh, str) else gh.get_text())
+                gruppe_name = f"Gruppe {gruppe_name_match.group(1)}" if gruppe_name_match else ""
+
+                # Finde die nächste Tabelle nach diesem Header
+                parent = gh.parent if not isinstance(gh, str) else gh.parent
+                next_table = None
+                for sibling in parent.find_all_next():
+                    if sibling.name == "table" and sibling.find("th"):
+                        # Prüfe ob es eine Termine-Tabelle ist (hat Tag/Zeit Spalten)
+                        headers_text = " ".join(th.get_text(strip=True) for th in sibling.find_all("th"))
+                        if "Tag" in headers_text and "Zeit" in headers_text:
+                            next_table = sibling
+                            break
+                    # Stop wenn nächste Gruppe kommt
+                    if sibling.name in ["h2", "h3"] and "Gruppe" in sibling.get_text():
                         break
 
-                for cell in cells:
-                    raum_link = cell.find("a", title=re.compile(r"Details ansehen zu Raum"))
-                    if raum_link:
-                        termin["raum"] = raum_link.get_text(strip=True)
-                        break
+                if next_table:
+                    termine = self._parse_termine_table(next_table)
+                    if termine:
+                        # Dozent aus der Gruppen-Tabelle extrahieren
+                        gruppe_dozent = ""
+                        for row in next_table.find_all("tr")[1:]:
+                            cells = row.find_all("td")
+                            for cell in cells:
+                                # Lehrperson-Spalte finden
+                                links = cell.find_all("a")
+                                for link in links:
+                                    href = link.get("href", "")
+                                    if "personal" in href:
+                                        gruppe_dozent = link.get_text(strip=True)
+                                        break
 
-                if termin.get("tag"):
-                    termine.append(termin)
+                        for t in termine:
+                            t["gruppe"] = gruppe_name
+                            if gruppe_dozent and not t.get("dozent"):
+                                t["dozent"] = gruppe_dozent
+                        gruppen.extend(termine)
+        else:
+            # Kein Gruppen-Modus: Normale Termine-Tabelle
+            termine_table = soup.find("table", summary="Übersicht über alle Veranstaltungstermine")
+            if termine_table:
+                termine = self._parse_termine_table(termine_table)
+                gruppen.extend(termine)
 
-            if termine:
-                result["tag"] = termine[0].get("tag", "")
-                result["zeit"] = termine[0].get("zeit", "")
-                result["rhythmus"] = termine[0].get("rhythmus", "")
-                result["raum"] = termine[0].get("raum", "")
-                result["weitere_termine"] = termine[1:] if len(termine) > 1 else []
+        result["gruppen"] = gruppen
+
+        # Rückwärtskompatibilität: Erste Gruppe als Haupttermin
+        if gruppen:
+            result["tag"] = gruppen[0].get("tag", "")
+            result["zeit"] = gruppen[0].get("zeit", "")
+            result["rhythmus"] = gruppen[0].get("rhythmus", "")
+            result["raum"] = gruppen[0].get("raum", "")
 
         # DOZENTEN
         dozenten_table = soup.find("table", summary="Verantwortliche Dozenten")
+        if not dozenten_table:
+            dozenten_table = soup.find("table", summary="Zugeordnete Personen")
         if dozenten_table:
             dozenten = []
             for row in dozenten_table.find_all("tr")[1:]:
@@ -409,6 +487,40 @@ class QISScraper:
                     result["voraussetzungen"] = text
 
         return result
+
+    def _parse_termine_table(self, table):
+        """Parst eine Termine-Tabelle und gibt Liste von Terminen zurück."""
+        termine = []
+        rows = table.find_all("tr")
+        for row in rows[1:]:
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue
+
+            termin = {}
+            cell_texts = [c.get_text(strip=True) for c in cells]
+
+            for i, text in enumerate(cell_texts):
+                if re.match(r'^(Mo|Di|Mi|Do|Fr|Sa|So)\.?$', text):
+                    termin["tag"] = text
+                    if i + 1 < len(cell_texts):
+                        termin["zeit"] = cell_texts[i + 1].replace('\xa0', ' ')
+                    if i + 2 < len(cell_texts):
+                        termin["rhythmus"] = cell_texts[i + 2]
+                    break
+
+            for cell in cells:
+                raum_link = cell.find("a", title=re.compile(r"Details ansehen zu Raum"))
+                if not raum_link:
+                    raum_link = cell.find("a", href=re.compile(r"raum"))
+                if raum_link:
+                    termin["raum"] = raum_link.get_text(strip=True)
+                    break
+
+            if termin.get("tag"):
+                termine.append(termin)
+
+        return termine
 
 
 def tree_to_dict(nodes):
